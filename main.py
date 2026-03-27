@@ -237,6 +237,25 @@ async def get_trail_recommendations(location: str = Query(..., description="City
     return response
 
 
+@app.get("/autocomplete")
+async def autocomplete(input: str = Query(..., description="Search input for city autocomplete")):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+                params={
+                    "input": input,
+                    "types": "(cities)",
+                    "key": GOOGLE_PLACES_API_KEY,
+                },
+            )
+            resp.raise_for_status()
+            predictions = resp.json().get("predictions", [])
+            return {"suggestions": [p["description"] for p in predictions]}
+    except Exception:
+        return {"suggestions": []}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
