@@ -31,6 +31,8 @@ openai_client = AzureOpenAI(
 )
 AZURE_OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
+_trail_cache: dict[str, dict] = {}
+
 
 async def geocode(client: httpx.AsyncClient, location: str) -> tuple[float, float]:
     resp = await client.get(
@@ -188,6 +190,12 @@ async def fetch_trail_data(client: httpx.AsyncClient, trail: dict, location: str
 
 @app.get("/get-trail-recommendations")
 async def get_trail_recommendations(location: str = Query(..., description="City, state, or address")):
+    cache_key = location.strip().lower()
+    if cache_key in _trail_cache:
+        entry = _trail_cache[cache_key]
+        if datetime.utcnow() - entry["timestamp"] < timedelta(hours=24):
+            return entry["response"]
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         lat, lng = await geocode(client, location)
         trails, weather = await asyncio.gather(
@@ -224,7 +232,9 @@ async def get_trail_recommendations(location: str = Query(..., description="City
             "gear_list": synthesis["gear_list"],
         })
 
-    return {"trails": results}
+    response = {"trails": results}
+    _trail_cache[cache_key] = {"response": response, "timestamp": datetime.utcnow()}
+    return response
 
 
 @app.get("/health")
