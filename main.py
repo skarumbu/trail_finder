@@ -1,6 +1,9 @@
 import asyncio
 import json
 import os
+import logging
+import time
+import uuid
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -10,6 +13,39 @@ import httpx
 from openai import AzureOpenAI
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("trail-finder")
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.time()
+        rid = str(uuid.uuid4())[:8]
+        try:
+            response = await call_next(request)
+            logger.info(json.dumps({
+                "event": "request",
+                "service": "trail-finder",
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": round((time.time() - start) * 1000, 1),
+                "request_id": rid,
+            }))
+            return response
+        except Exception as exc:
+            logger.error(json.dumps({
+                "event": "error",
+                "service": "trail-finder",
+                "method": request.method,
+                "path": request.url.path,
+                "error": str(exc),
+                "duration_ms": round((time.time() - start) * 1000, 1),
+                "request_id": rid,
+            }))
+            raise
 
 app = FastAPI()
 
@@ -19,6 +55,7 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+app.add_middleware(MetricsMiddleware)
 
 GOOGLE_PLACES_API_KEY = os.environ["GOOGLE_PLACES_API_KEY"]
 GOOGLE_SEARCH_API_KEY = os.environ["GOOGLE_SEARCH_API_KEY"]
@@ -217,7 +254,7 @@ async def get_trail_recommendations(location: str = Query(..., description="City
         try:
             synthesis = synthesize(name, address, rating, td["reviews"], td["alltrails_snippet"], weather)
         except Exception as e:
-            print(f"Synthesis failed for {name}: {e}")
+            logger.error(f"Synthesis failed for {name}: {e}")
             synthesis = {
                 "condition_summary": "Unable to generate condition summary at this time.",
                 "gear_list": ["Water (2L+)", "Snacks", "Comfortable hiking shoes", "Sun protection"],
