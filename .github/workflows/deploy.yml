@@ -53,15 +53,10 @@ jobs:
           git pull origin main
           DATE=$(date -u +%Y-%m-%d)
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          python3 -c "
-import json
-with open('src/architecture-metadata.json') as f:
-    meta = json.load(f)
-meta['trail-finder'] = {'lastDeploy': '$DATE', 'commitSha': '$SHORT_SHA'}
-with open('src/architecture-metadata.json', 'w') as f:
-    json.dump(meta, f, indent=2)
-    f.write('\n')
-"
+          jq --arg date "$DATE" --arg sha "$SHORT_SHA" \
+            '."trail-finder" = {"lastDeploy": $date, "commitSha": $sha}' \
+            src/architecture-metadata.json > /tmp/meta.json
+          mv /tmp/meta.json src/architecture-metadata.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add src/architecture-metadata.json
