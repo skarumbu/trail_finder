@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import logging
 import time
@@ -70,6 +71,18 @@ AZURE_OPENAI_DEPLOYMENT = os.environ["AZURE_OPENAI_DEPLOYMENT"]
 
 _trail_cache: dict[str, dict] = {}
 
+HIGH_QUALITY_THRESHOLD = 7
+MIN_RESULTS = 5
+MAX_RESULTS = 15
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
 
 async def geocode(client: httpx.AsyncClient, location: str) -> tuple[float, float]:
     resp = await client.get(
@@ -95,7 +108,7 @@ async def search_trails(client: httpx.AsyncClient, location: str, lat: float, ln
         },
     )
     resp.raise_for_status()
-    return resp.json().get("results", [])[:5]
+    return resp.json().get("results", [])[:20]
 
 
 async def get_place_details(client: httpx.AsyncClient, place_id: str) -> dict:
@@ -103,7 +116,7 @@ async def get_place_details(client: httpx.AsyncClient, place_id: str) -> dict:
         "https://maps.googleapis.com/maps/api/place/details/json",
         params={
             "place_id": place_id,
-            "fields": "name,rating,formatted_address,reviews,url",
+            "fields": "name,rating,formatted_address,reviews,url,geometry",
             "key": GOOGLE_PLACES_API_KEY,
         },
     )
@@ -127,11 +140,13 @@ async def search_alltrails(client: httpx.AsyncClient, trail_name: str, location:
     return items[0].get("snippet", "") if items else ""
 
 
-async def get_weekend_weather(client: httpx.AsyncClient, lat: float, lng: float) -> list[dict]:
+async def get_weather(client: httpx.AsyncClient, lat: float, lng: float) -> list[dict]:
     today = datetime.utcnow().date()
     days_until_saturday = (5 - today.weekday()) % 7 or 7
     saturday = today + timedelta(days=days_until_saturday)
     sunday = saturday + timedelta(days=1)
+    # Include today + coming weekend so the AI can assess both current and upcoming conditions
+    end_date = sunday if saturday != today else today + timedelta(days=1)
 
     resp = await client.get(
         "https://api.open-meteo.com/v1/forecast",
@@ -143,8 +158,8 @@ async def get_weekend_weather(client: httpx.AsyncClient, lat: float, lng: float)
             "windspeed_unit": "mph",
             "precipitation_unit": "inch",
             "timezone": "auto",
-            "start_date": str(saturday),
-            "end_date": str(sunday),
+            "start_date": str(today),
+            "end_date": str(end_date),
         },
     )
     resp.raise_for_status()
@@ -165,7 +180,8 @@ def synthesize(
     name: str,
     address: str,
     rating: float,
-    google_reviews: list[str],
+    distance_km: float,
+    reviews: list[dict],
     alltrails_snippet: str,
     weather: list[dict],
 ) -> dict:
@@ -175,31 +191,50 @@ def synthesize(
         for d in weather
     ) or "No forecast available."
 
-    reviews_text = "\n".join(f"- {r}" for r in google_reviews) or "No reviews available."
+    now_ts = datetime.utcnow().timestamp()
+    annotated = []
+    for r in reviews:
+        age_days = (now_ts - r.get("time", 0)) / 86400 if r.get("time") else None
+        relative = r.get("relative", "")
+        if age_days is not None and age_days <= 14:
+            prefix = f"[Recent: {relative}]"
+        elif age_days is not None and 335 <= age_days <= 395:
+            prefix = "[Same season, prior year]"
+        else:
+            prefix = f"[{relative}]" if relative else ""
+        annotated.append(f"- {prefix} {r['text']}")
+    reviews_text = "\n".join(annotated) or "No reviews available."
     alltrails_text = alltrails_snippet or "No AllTrails data available."
 
-    prompt = f"""You are an expert hiking guide. Based on the data below, write a trail condition summary and gear list for hiking this trail this weekend.
+    prompt = f"""You are an expert hiking guide. Assess this trail's suitability for hiking TODAY.
 
-Trail: {name}
-Location: {address}
-Google Maps Rating: {rating}/5
+Trail: {name} | {address} | Rating: {rating}/5 | Distance: {distance_km:.1f} km from city
 
-Weekend Weather Forecast:
+Today's Weather (and upcoming weekend):
 {weather_text}
 
-Recent Google Maps Reviews:
+Reviews (annotated by recency):
 {reviews_text}
 
-AllTrails Trip Report:
+AllTrails snippet:
 {alltrails_text}
 
-Respond ONLY with valid JSON in this exact format (no markdown fences):
+Respond ONLY with valid JSON (no markdown fences):
 {{
-  "condition_summary": "2-3 sentences on current trail conditions based on reviews and weather",
-  "gear_list": ["item1", "item2", "item3", "item4"]
+  "condition_summary": "2-3 sentences on trail conditions TODAY based on recent reviews and weather",
+  "gear_list": ["item1", "item2", "item3", "item4"],
+  "condition_tags": ["tag1", "tag2", "tag3"],
+  "suitability_score": 7,
+  "difficulty": "moderate"
 }}
 
-The gear_list should have 4-6 specific items tailored to the conditions and weather."""
+condition_tags: 3-6 short lowercase tags from: muddy, dry, wet, icy, dusty, crowded, quiet, shaded, exposed, windy, hot, cold, dog-friendly, well-maintained, overgrown, scenic
+
+suitability_score: integer 0-10. 10=ideal conditions, 0=avoid today. Consider: recent rain→mud, high wind, extreme temps, very recent negative reviews.
+
+difficulty: "easy", "moderate", or "hard" inferred from reviews/terrain.
+
+gear_list: 4-6 specific items tailored to the conditions and weather."""
 
     response = openai_client.chat.completions.create(
         model=AZURE_OPENAI_DEPLOYMENT,
@@ -218,32 +253,43 @@ async def fetch_trail_data(client: httpx.AsyncClient, trail: dict, location: str
         search_alltrails(client, name, location),
     )
 
+    reviews = [
+        {
+            "text": r["text"],
+            "time": r.get("time", 0),
+            "relative": r.get("relative_time_description", ""),
+        }
+        for r in details.get("reviews", []) if r.get("text")
+    ]
+
+    place_geo = details.get("geometry", {}).get("location", {})
     return {
         "trail": trail,
-        "reviews": [r["text"] for r in details.get("reviews", []) if r.get("text")],
+        "reviews": reviews,
         "alltrails_snippet": alltrails_snippet,
+        "place_lat": place_geo.get("lat"),
+        "place_lng": place_geo.get("lng"),
     }
 
 
 @app.get("/get-trail-recommendations")
 async def get_trail_recommendations(location: str = Query(..., description="City, state, or address")):
-    cache_key = location.strip().lower()
+    date_str = datetime.utcnow().strftime("%Y-%m-%d")
+    cache_key = f"{location.strip().lower()}:{date_str}"
     if cache_key in _trail_cache:
-        entry = _trail_cache[cache_key]
-        if datetime.utcnow() - entry["timestamp"] < timedelta(hours=24):
-            return entry["response"]
+        return _trail_cache[cache_key]
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         lat, lng = await geocode(client, location)
         trails, weather = await asyncio.gather(
             search_trails(client, location, lat, lng),
-            get_weekend_weather(client, lat, lng),
+            get_weather(client, lat, lng),
         )
         trail_data = await asyncio.gather(*[
             fetch_trail_data(client, trail, location) for trail in trails
         ])
 
-    results = []
+    scored = []
     for td in trail_data:
         trail = td["trail"]
         name = trail.get("name", "Unknown Trail")
@@ -251,26 +297,43 @@ async def get_trail_recommendations(location: str = Query(..., description="City
         rating = trail.get("rating", 0.0)
         place_id = trail.get("place_id", "")
 
+        place_lat = td.get("place_lat") or trail.get("geometry", {}).get("location", {}).get("lat")
+        place_lng = td.get("place_lng") or trail.get("geometry", {}).get("location", {}).get("lng")
+        distance_km = round(haversine_km(lat, lng, place_lat, place_lng), 1) if place_lat and place_lng else None
+
         try:
-            synthesis = synthesize(name, address, rating, td["reviews"], td["alltrails_snippet"], weather)
+            synthesis = synthesize(name, address, rating, distance_km or 0.0, td["reviews"], td["alltrails_snippet"], weather)
         except Exception as e:
             logger.error(f"Synthesis failed for {name}: {e}")
             synthesis = {
                 "condition_summary": "Unable to generate condition summary at this time.",
                 "gear_list": ["Water (2L+)", "Snacks", "Comfortable hiking shoes", "Sun protection"],
+                "condition_tags": [],
+                "suitability_score": 5,
+                "difficulty": "moderate",
             }
 
-        results.append({
+        scored.append({
             "name": name,
             "address": address,
             "rating": rating,
+            "distance_km": distance_km,
             "google_maps_url": f"https://www.google.com/maps/place/?q=place_id:{place_id}",
             "condition_summary": synthesis["condition_summary"],
-            "gear_list": synthesis["gear_list"],
+            "gear_list": synthesis.get("gear_list", []),
+            "condition_tags": synthesis.get("condition_tags", []),
+            "suitability_score": synthesis.get("suitability_score", 5),
+            "difficulty": synthesis.get("difficulty", "moderate"),
         })
 
-    response = {"trails": results}
-    _trail_cache[cache_key] = {"response": response, "timestamp": datetime.utcnow()}
+    above = [t for t in scored if t["suitability_score"] >= HIGH_QUALITY_THRESHOLD]
+    if len(above) >= MIN_RESULTS:
+        result_trails = above[:MAX_RESULTS]
+    else:
+        result_trails = sorted(scored, key=lambda x: x["suitability_score"], reverse=True)[:MIN_RESULTS]
+
+    response = {"trails": result_trails}
+    _trail_cache[cache_key] = response
     return response
 
 
