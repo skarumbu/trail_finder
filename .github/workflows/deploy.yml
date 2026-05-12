@@ -1,4 +1,4 @@
-name: Deploy to Azure Container Apps
+﻿name: Deploy to Azure Container Apps
 
 on:
   push:
@@ -72,5 +72,5 @@ jobs:
       commit_sha: ${{ github.sha }}
       commit_message: ${{ github.event.head_commit.message }}
     secrets:
-      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      ARCH_CONTENT_FOUNDRY_KEY: ${{ secrets.ARCH_CONTENT_FOUNDRY_KEY }}
       ARCH_UPDATE_GH_TOKEN: ${{ secrets.MY_WEBSITE_DISPATCH_TOKEN }}
