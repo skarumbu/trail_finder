@@ -1,22 +1,25 @@
-name: Design Doc Check
+name: Wiki Update PR
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [master]
+    branches:
+      - master
 
 jobs:
-  design-doc:
+  wiki-update-pr:
     # Skip PRs opened by this automation itself (design-doc/*, wiki-update/*,
-    # or authored by github-actions[bot]) — otherwise each generated ADR PR
+    # or authored by github-actions[bot]) — otherwise each generated PR
     # re-triggers this workflow on itself, cascading indefinitely.
     if: |
       github.actor != 'github-actions[bot]' &&
       !startsWith(github.head_ref, 'design-doc/') &&
       !startsWith(github.head_ref, 'wiki-update/')
-    uses: skarumbu/my-website/.github/workflows/design-doc-check-reusable.yml@main
+    permissions:
+      pull-requests: write
+    uses: skarumbu/my-website/.github/workflows/wiki-update-pr-reusable.yml@main
     with:
       repo_name: trail-finder
     secrets:
-      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-      DESIGN_DOC_GH_TOKEN: ${{ secrets.DESIGN_DOC_GH_TOKEN }}
+      ARCH_CONTENT_FOUNDRY_KEY: ${{ secrets.ARCH_CONTENT_FOUNDRY_KEY }}
+      WIKI_UPDATE_GH_TOKEN: ${{ secrets.WIKI_UPDATE_GH_TOKEN }}
